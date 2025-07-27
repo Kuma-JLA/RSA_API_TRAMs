@@ -1,0 +1,14 @@
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\APILibrary.dll
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\APILibrary.pdb
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.csproj.AssemblyReference.cache
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.csproj.CoreCompileInputs.cache
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcaptur.654645DC.Up2Date
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\IQcapture_TRAMs.exe.config
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\IQcapture_TRAMs.exe.manifest
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\IQcapture_TRAMs.application
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\IQcapture_TRAMs.exe
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\bin\x64\Release\IQcapture_TRAMs.pdb
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.exe.manifest
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.application
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.exe
+C:\Tektronix\TRAMsWalker\RSA_API_TRAMs-master\C#\IQStreaming\obj\x64\Release\IQcapture_TRAMs.pdb
