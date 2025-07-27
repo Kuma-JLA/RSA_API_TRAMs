@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Tektronix;
 
@@ -15,15 +16,15 @@ namespace IQStreaming
                 return;
             }
 
-            // Default values
+            //デフォルト設定
             int deviceId = 0;
             double centerFreq = 5220e6;
-            double refLevel = -10;
+            double refLevel = -25;
             double span = 40e6;
             int msec = 10000;
             string filename = "iqstream";
 
-            // Parse arguments
+            // ==== 引数パース ====
             foreach (var arg in args)
             {
                 if (arg.StartsWith("dev=")) deviceId = int.Parse(arg.Split('=')[1]);
@@ -35,93 +36,113 @@ namespace IQStreaming
             }
 
             var api = new APIWrapper();
+            ReturnStatus rs;
 
-            // Search for devices.
+            //デバイス検索・接続
             int[] devId = null;
             string[] devSn = null;
             string[] devType = null;
-            var rs = api.DEVICE_Search(ref devId, ref devSn, ref devType);
+            rs = api.DEVICE_Search(ref devId, ref devSn, ref devType);
             if (devId == null || deviceId >= devId.Length)
             {
-                Console.WriteLine("\nNo devices found or invalid device ID!");
+                Console.WriteLine("ERROR: No devices found or invalid device ID!");
                 return;
             }
 
-            // Reset and connect to the selected device.
-            if (rs == ReturnStatus.noError)
-            {
-                rs = api.DEVICE_Reset(devId[deviceId]);
-                rs = api.DEVICE_Connect(devId[deviceId]);
-            }
-
+            rs = api.DEVICE_Reset(devId[deviceId]);
+            rs = api.DEVICE_Connect(devId[deviceId]);
             if (rs != ReturnStatus.noError)
             {
-                Console.WriteLine("\nERROR: " + rs);
+                Console.WriteLine("ERROR: " + rs);
                 return;
             }
-            else
+
+            Console.WriteLine($"CONNECTED TO: {devType[deviceId]}");
+
+            //コンフィグ設定
+            api.CONFIG_SetCenterFreq(centerFreq);
+            api.CONFIG_SetReferenceLevel(refLevel);
+            api.CONFIG_SetAutoAttenuationEnable(false);
+            api.CONFIG_SetRFPreampEnable(true);
+            api.CONFIG_SetRFAttenuator(0);
+
+            //帯域幅設定
+            api.IQSTREAM_SetAcqBandwidth(span);
+            double bwAct = 0, srSps = 0;
+            api.IQSTREAM_GetAcqParameters(ref bwAct, ref srSps);
+            Console.WriteLine($"Bandwidth Requested: {span / 1e6:F3} MHz, Actual: {bwAct / 1e6:F3} MHz");
+            Console.WriteLine($"Sample Rate: {srSps / 1e6:F} MS/s");
+
+            //出力設定
+            api.IQSTREAM_SetOutputConfiguration(IQSOUTDEST.IQSOD_FILE_TIQ, IQSOUTDTYPE.IQSODT_INT16);
+            api.IQSTREAM_SetDiskFileLength(msec);
+            api.IQSTREAM_SetDiskFilenameBase(filename);
+            api.IQSTREAM_SetDiskFilenameSuffix(IQSSDFN_SUFFIX.IQSSDFN_SUFFIX_NONE);
+
+            //測定＋進捗表示＋再試行
+            double totalSamples = srSps * msec / 1000.0;
+            int retryCount = 0;
+
+            Console.WriteLine("\n測定開始...");
+            api.DEVICE_Run();
+            api.IQSTREAM_Start();
+            Console.WriteLine("測定中...");
+
+            ulong previousSamples = 0;
+            var stagnationTimer = Stopwatch.StartNew();
+            ulong numSamples = 0;
+
+            while (true)
             {
-                Console.WriteLine("\nCONNECTED TO: " + devType[deviceId]);
-            }
+                bool complete = false, writing = false;
+                api.IQSTREAM_GetDiskFileWriteStatus(ref complete, ref writing);
 
-            // Set the center frequency and reference level.
-            rs = api.CONFIG_SetCenterFreq(centerFreq);
-            rs = api.CONFIG_SetReferenceLevel(refLevel);
-
-            // Configure Auto Attenuation, RF Preamp, and RF Attenuator.
-            rs = api.CONFIG_SetAutoAttenuationEnable(false); // Disable Auto Attenuation.
-            rs = api.CONFIG_SetRFPreampEnable(true); // Enable RF Preamp.
-            rs = api.CONFIG_SetRFAttenuator(0); // Set RF Attenuator to 0 dB.
-
-            // Set the acquisition bandwidth before putting the device in Run mode.
-            rs = api.IQSTREAM_SetAcqBandwidth(span);
-            // Get the actual bandwidth and sample rate.
-            double bwAct = 0;
-            double srSps = 0;
-            rs = api.IQSTREAM_GetAcqParameters(ref bwAct, ref srSps);
-
-            Console.WriteLine("Bandwidth Requested: {0:F3} MHz, Actual: {1:F3} MHz", span / 1e6, bwAct / 1e6);
-            Console.WriteLine("Sample Rate: {0:F} MS/s", srSps / 1e6);
-
-            // Set the output configuration.
-            var dest = IQSOUTDEST.IQSOD_FILE_TIQ; // Destination is a TIQ file in this example.
-            var dtype = IQSOUTDTYPE.IQSODT_INT16; // Output type is a 16 bit integer.
-            rs = api.IQSTREAM_SetOutputConfiguration(dest, dtype);
-
-            // Register the settings for the output file.
-            var fnsuffix = IQSSDFN_SUFFIX.IQSSDFN_SUFFIX_NONE;
-            rs = api.IQSTREAM_SetDiskFileLength(msec);
-            rs = api.IQSTREAM_SetDiskFilenameBase(filename);
-            rs = api.IQSTREAM_SetDiskFilenameSuffix(fnsuffix);
-
-            // Start the live IQ capture.
-            var numSamples = 0UL;
-            var isActive = true;
-            var iqInfo = new IQSTRMIQINFO();
-            var fileinfo = new IQSTRMFILEINFO();
-            // Put the device into Run mode before starting IQ capture.
-            rs = api.DEVICE_Run();
-            Console.WriteLine("\nIQ Capture starting...");
-            rs = api.IQSTREAM_Start();
-            while (isActive)
-            {
-                // Determine if the write is complete.
-                var complete = false;
-                var writing = false;
-                rs = api.IQSTREAM_GetDiskFileWriteStatus(ref complete, ref writing);
-                isActive = !complete;
-                rs = api.IQSTREAM_GetDiskFileInfo(ref fileinfo);
+                var fileinfo = new IQSTRMFILEINFO();
+                api.IQSTREAM_GetDiskFileInfo(ref fileinfo);
                 numSamples = fileinfo.numberSamples;
+
+                //進捗更新
+                double progress = numSamples / totalSamples * 100.0;
+                Console.Write($"\rProgress: {progress:F1}% ({numSamples} samples)");
+
+                //進捗変化チェック
+                if (numSamples != previousSamples)
+                {
+                    previousSamples = numSamples;
+                    stagnationTimer.Restart();
+                }
+                else if (stagnationTimer.Elapsed.TotalSeconds >= 10)
+                {
+                    if (retryCount < 1)
+                    {
+                        Console.WriteLine("\n10秒間進捗なし検出。再試行します。");
+                        api.IQSTREAM_Stop();
+                        api.IQSTREAM_Start();
+                        retryCount++;
+                        previousSamples = 0;
+                        stagnationTimer.Restart();
+                        continue;
+                    }
+                    else
+                    {
+                        Console.WriteLine("\n再試行回数上限に達したため測定を終了します。");
+                        break;
+                    }
+                }
+
+                if (complete)
+                    break;
             }
 
-            Console.WriteLine("{0} Samples written to tiq file.", numSamples);
+            Console.WriteLine();  //進捗バーの末尾改行
+            Console.WriteLine($"\n{numSamples} Samples written to tiq file.");
 
-            // Disconnect the device and finish up.
-            rs = api.IQSTREAM_Stop();
-            rs = api.DEVICE_Stop();
-            rs = api.DEVICE_Disconnect();
+            //後片付け
+            api.IQSTREAM_Stop();
+            api.DEVICE_Stop();
+            api.DEVICE_Disconnect();
 
-            Console.WriteLine("\nIQ streaming routine complete.");
+            Console.WriteLine("測定完了");
         }
 
         private static void PrintUsage()
