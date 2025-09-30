@@ -1,202 +1,318 @@
-﻿using System;
-using System.Collections.Generic;
+// File: DPXCsvExporter.cs
+// Build: csc DPXCsvExporter.cs (または Visual Studio / dotnet でプロジェクト化)
+// 必須: Tektronix API ライブラリ（元サンプルの APIWrapper 等）への参照を設定してください。
+
+using System;
+using System.IO;
+using System.Globalization;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Collections.Generic;
 using Tektronix;
 
-namespace DPXFrameAcquisition
+namespace DPXCsvExporter
 {
     class Program
     {
+        static void PrintUsage()
+        {
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  DPXCsvExporter.exe [--device <deviceID>] [--center <Hz>] [--bandwidth <Hz>]");
+            Console.WriteLine("                     [--rbw <Hz>] [--tracelength <points>] [--frames <count>] [--reflevel <dBm>]");
+            Console.WriteLine("Examples:");
+            Console.WriteLine("  DPXCsvExporter.exe --device 0 --center 103300000 --bandwidth 40000000 --rbw 5000000 --tracelength 1024 --frames 100 --reflevel -10");
+        }
+
+        static double[] Linspace(double start, double stop, int num)
+        {
+            if (num == 1) return new double[] { start };
+            double[] r = new double[num];
+            double step = (stop - start) / (num - 1);
+            for (int i = 0; i < num; i++) r[i] = start + i * step;
+            return r;
+        }
+
+        static float[] ResampleLinear(float[] src, int targetLen)
+        {
+            if (src == null) return new float[targetLen];
+            if (src.Length == targetLen) return (float[])src.Clone();
+            float[] outArr = new float[targetLen];
+            int n = src.Length;
+            for (int i = 0; i < targetLen; i++)
+            {
+                double pos = (double)i * (n - 1) / (targetLen - 1);
+                int i0 = (int)Math.Floor(pos);
+                int i1 = Math.Min(i0 + 1, n - 1);
+                double frac = pos - i0;
+                outArr[i] = (float)((1.0 - frac) * src[i0] + frac * src[i1]);
+            }
+            return outArr;
+        }
+
+        // 変換ルールは必ずAPIドキュメントで確認してください。
+        // ここでは p (W) -> dBm: 10*log10(p * 1e3) を仮定しています。
+        static double[] ConvertToDbm(float[] linearPowerArray)
+        {
+            var outArr = new double[linearPowerArray.Length];
+            for (int i = 0; i < linearPowerArray.Length; i++)
+            {
+                double val = linearPowerArray[i];
+                if (val <= 0)
+                {
+                    // 非正値は非常に小さい値に置き換える（-inf を避ける）
+                    outArr[i] = -300.0;
+                }
+                else
+                {
+                    outArr[i] = 10.0 * Math.Log10(val * 1e3); // W -> mW -> dBm
+                }
+            }
+            return outArr;
+        }
+
         static void Main(string[] args)
         {
+            // --- デフォルト値 ---
+            int? requestedDeviceId = null;
+            double centerFreq = 103.3e6;
+            double bandwidth = 40e6;
+            double RBW = 5e6;
+            int requestedTraceLength = 0; // 0 = use device's trace length
+            int numFrames = 100;
+            double refLevel = -10.0;
+            int traceIndexToUse = 0; // use first spectrum trace by default
+
+            // --- 引数解析（非常にシンプル）---
+            for (int i = 0; i < args.Length; i++)
+            {
+                var a = args[i].ToLowerInvariant();
+                try
+                {
+                    if (a == "--device" && i + 1 < args.Length) { requestedDeviceId = int.Parse(args[++i]); }
+                    else if (a == "--center" && i + 1 < args.Length) { centerFreq = double.Parse(args[++i], CultureInfo.InvariantCulture); }
+                    else if (a == "--bandwidth" && i + 1 < args.Length) { bandwidth = double.Parse(args[++i], CultureInfo.InvariantCulture); }
+                    else if (a == "--rbw" && i + 1 < args.Length) { RBW = double.Parse(args[++i], CultureInfo.InvariantCulture); }
+                    else if (a == "--tracelength" && i + 1 < args.Length) { requestedTraceLength = int.Parse(args[++i]); }
+                    else if (a == "--frames" && i + 1 < args.Length) { numFrames = int.Parse(args[++i]); }
+                    else if (a == "--reflevel" && i + 1 < args.Length) { refLevel = double.Parse(args[++i], CultureInfo.InvariantCulture); }
+                    else if (a == "--traceindex" && i + 1 < args.Length) { traceIndexToUse = int.Parse(args[++i]); }
+                    else { /* ignore unknown */ }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Argument parse error: " + ex.Message);
+                    PrintUsage();
+                    return;
+                }
+            }
+
             APIWrapper api = new APIWrapper();
 
-            // Search for devices.
+            // --- デバイス検索 ---
             int[] devID = null;
             string[] devSN = null;
             string[] devType = null;
-	        ReturnStatus rs = api.DEVICE_Search(ref devID, ref devSN, ref devType);
+            ReturnStatus rs = api.DEVICE_Search(ref devID, ref devSN, ref devType);
+            if (rs != ReturnStatus.noError || devID == null || devID.Length == 0)
+            {
+                Console.WriteLine("No devices found or DEVICE_Search failed: {0}", rs);
+                return;
+            }
 
-            // Connect to the first device detected.
-            rs = api.DEVICE_Reset(devID[0]);
-            rs = api.DEVICE_Connect(devID[0]);
+            int useDeviceId = requestedDeviceId ?? devID[0];
+            if (!devID.Contains(useDeviceId))
+            {
+                Console.WriteLine("Requested device id {0} not found. Available: {1}", useDeviceId, string.Join(",", devID));
+                return;
+            }
 
-	        // The following is an example on how to use the return status of an API function.
-	        // For simplicity, it will not be used in the rest of the program.
-	        // This is a fatal error: the device could not be connected.
+            // --- 接続 ---
+            rs = api.DEVICE_Reset(useDeviceId);
+            rs = api.DEVICE_Connect(useDeviceId);
             if (rs != ReturnStatus.noError)
             {
-                Console.WriteLine("ERROR: {0}", rs);
-                goto end;
+                Console.WriteLine("ERROR connecting to device {0}: {1}", useDeviceId, rs);
+                return;
             }
-            else
-            {
-                // print the name of the connected device.
-                Console.WriteLine("CONNECTED TO: {0}", devType[0]);
-            }
+            Console.WriteLine("Connected to device {0}", useDeviceId);
 
-            // Set the center frequency and reference level.
-            rs = api.CONFIG_SetCenterFreq(103.3e6);
-            rs = api.CONFIG_SetReferenceLevel(-10);
+            // --- 基本設定 ---
+            rs = api.CONFIG_SetCenterFreq(centerFreq);
+            rs = api.CONFIG_SetReferenceLevel(refLevel);
 
-            // Define the number of points in the trace, the amount of frames, and the output filename.
-            int numFrames = 100;
-
-            // Check the RBW range of the device and print the min and max values.
-            double bandwidth = 40e6;
-            double minRBW = 0;
-            double maxRBW = 0;
+            // RBW 範囲照会（元サンプル同様）
+            double minRBW = 0, maxRBW = 0;
             rs = api.DPX_GetRBWRange(bandwidth, ref minRBW, ref maxRBW);
+            Console.WriteLine("Bandwidth request: {0} Hz, RBW range: min {1} Hz, max {2} Hz", bandwidth, minRBW, maxRBW);
 
-            Console.WriteLine(string.Empty);
-            Console.WriteLine("Minimum RBW: {0}", minRBW);
-            Console.WriteLine("Maximum RBW: {0}", maxRBW);
-
-            // Reset DPX before acquisition.
+            // DPX 初期化とパラメータ設定
             rs = api.DPX_Reset();
-
-            // Set the parameters for the DPX acquisition.
-            double RBW = 5e6;
-            int width = 200; // Width of the frame images in pixels.
-            int tracepts = 1; // Trace points per pixel.
-            VerticalUnitType vertunits = VerticalUnitType.VerticalUnit_dBm; // The vertical units of the frames.	
-            double yTop = 0.0, yBottom = -100.0; // Y range for frames.
-            bool infPersist = false, showOnlyTrigFrame = false; // Disable infinite persistence and enable DPX frame to be available continuously.
-            double persistTime = 1.0; // Time for a previous signal to remain onscreen.
+            int width = 200; // この幅は DPX bitmap width の設定（多くの機器は自動決定）
+            int tracepts = 1;
+            VerticalUnitType vertunits = VerticalUnitType.VerticalUnit_dBm;
+            double yTop = 0.0, yBottom = -100.0;
+            bool infPersist = false, showOnlyTrigFrame = false;
+            double persistTime = 1.0;
             rs = api.DPX_SetParameters(bandwidth, RBW, width, tracepts, vertunits, yTop, yBottom, infPersist, persistTime, showOnlyTrigFrame);
+            rs = api.DPX_Configure(true, false); // スペクトラム ON, スペクトログラム OFF
 
-            // Enable the DPX spectrum, and don't enable the spectrogram.
-            rs = api.DPX_Configure(true, false);
-    
-            // Set the trace type for all three traces.
-            int trace1_ID = 0;
-            int trace2_ID = 1;
-            int trace3_ID = 2;
-            TraceType trace1_traceType = TraceType.TraceTypeMax;
-            TraceType trace2_traceType = TraceType.TraceTypeMin;
-            TraceType trace3_traceType = TraceType.TraceTypeAverage;
-            rs = api.DPX_SetSpectrumTraceType(trace1_ID, trace1_traceType);
-            rs = api.DPX_SetSpectrumTraceType(trace2_ID, trace2_traceType);
-            rs = api.DPX_SetSpectrumTraceType(trace3_ID, trace3_traceType);
+            // トレースタイプ等（元サンプルと同様）
+            rs = api.DPX_SetSpectrumTraceType(0, TraceType.TraceTypeMax);
+            rs = api.DPX_SetSpectrumTraceType(1, TraceType.TraceTypeMin);
+            rs = api.DPX_SetSpectrumTraceType(2, TraceType.TraceTypeAverage);
 
-            // Get the settings for the DPX acquisition.
+            // 設定取得
             DPX_SettingsStruct getSettings = new DPX_SettingsStruct();
             rs = api.DPX_GetSettings(ref getSettings);
+            Console.WriteLine("DPX settings: bitmapWidth={0}, bitmapHeight={1}, traceLength(device)={2}, actualRBW={3} MHz",
+                getSettings.bitmapWidth, getSettings.bitmapHeight, getSettings.traceLength, getSettings.actualRBW / 1e6);
 
-            // Display the settings.
-            Console.WriteLine();
-            Console.WriteLine("DPX Settings:");
-            Console.WriteLine("\tSpectrum: {0}", getSettings.enableSpectrum ? "ON" : "OFF");
-            Console.WriteLine("\tSogram: {0}", getSettings.enableSpectrogram ? "ON" : "OFF");
-            Console.WriteLine("\tBitmap Width: {0}", getSettings.bitmapWidth);
-            Console.WriteLine("\tBitmap Height: {0}", getSettings.bitmapHeight);
-            Console.WriteLine("\tTrace Length: {0}", getSettings.traceLength);
-            Console.WriteLine("\tDecay Factor: {0}", getSettings.decayFactor);
-            Console.WriteLine("\tRBW: {0}", (getSettings.actualRBW / 1000000.0));
-
-            // Initialize frame buffers.
+            // フレームバッファ領域の確保
             var frameBuffer = new DPX_FrameBuffer();
-    
-            // Enable DPX operation.
-            rs = api.DPX_SetEnable(true); // This function must be called before DEVICE_Run().
-    
-            // Put the device in Run mode to start DPX.
+
+            // DPX 有効化 -> Run
+            rs = api.DPX_SetEnable(true);
             rs = api.DEVICE_Run();
-    
-            // Begin the DPX acquisition.
-            int bmpidx = 10; // The index of the frame to write to a file.
-            bool isActive = true; // Flag to enable DPX acquisition routine.
-            long frameAvailCount = 0; // Variable to track how many times an available frame is detected.
-            long frameCount = 0, fftCount = 0; // Variables to check frame count information.
-            int waitTimeoutMsec = 1000; // Maximum allowable wait time for each data acquistion.
-            int numTimeouts = 3; // Maximum amount of attempts to acquire data if a timeout occurs.
-                                 // Note: the total wait time to acquire data is waitTimeoutMsec x numTimeouts.
-            int timeoutCount = 0; // Variable to track the timeouts.
 
-            // Create a file to write the traces to.
-            var traceFile = new System.IO.StreamWriter("DPXdata.txt");
-
-            while (isActive)
+            // CSV 出力準備
+            string csvFileName = string.Format("DPX_{0}_{1}Hz_{2}BW_{3}frames.csv", useDeviceId, (long)centerFreq, (long)bandwidth, numFrames);
+            using (var csv = new StreamWriter(csvFileName, false, System.Text.Encoding.UTF8))
             {
-                // Wait for DPX.
-                bool isDpxReady = false;
-                rs = api.DPX_WaitForDataReady(waitTimeoutMsec,ref isDpxReady);
+                csv.NewLine = "\n";
+                Console.WriteLine("CSV output: " + csvFileName);
 
-                // If DPX is ready, check if the frame buffer is available.
-                bool frameAvail = false;
-                if(isDpxReady)
+                // 実取得トレース長（機器から）
+                int actualDeviceTraceLength = getSettings.traceLength > 0 ? getSettings.traceLength : 0;
+                int targetTraceLen = actualDeviceTraceLength;
+                if (requestedTraceLength > 0) targetTraceLen = requestedTraceLength;
+                if (targetTraceLen <= 0)
                 {
-                    rs = api.DPX_IsFrameBufferAvailable(ref frameAvail);
+                    // フェールセーフ
+                    targetTraceLen = 1024;
                 }
-                else // Keep track of how many timeouts occured.
-                    timeoutCount++;
 
-                //If the frame buffer is available, get the frame buffer.
-                if(frameAvail)
+                // frequency array (Hz) --- center +/- bandwidth/2 を targetTraceLen 点で分割
+                double startFreq = centerFreq - (bandwidth / 2.0);
+                double stopFreq = centerFreq + (bandwidth / 2.0);
+                double[] freqs = Linspace(startFreq, stopFreq, targetTraceLen);
+
+                // CSV ヘッダ行を書き出し
+                // header: timestamp(yyyy-mm-dd hh:mm:ss.ffffff), freq1[Hz], freq2[Hz], ...
+                var header = new List<string>();
+                header.Add("timestamp(yyyy-MM-dd HH:mm:ss.ffffff)");
+                foreach (var f in freqs)
                 {
-                    frameAvailCount++;
-                    // Get DPX data.
-                    rs = api.DPX_GetFrameBuffer(ref frameBuffer);
-                    // Check the latest frame.
-                    api.DPX_GetFrameInfo(ref frameCount, ref fftCount);
-                    // Acquire the current trace information.
-                    int traceLen = frameBuffer.spectrumTraceLength;
-                    int numTraces = frameBuffer.numSpectrumTraces;
-                    float[][] pTraces = frameBuffer.spectrumTraces;
-                    // Print trace information to file.
-                    for(int ntr = 0; ntr<numTraces; ntr++)
+                    header.Add(((long)f).ToString(CultureInfo.InvariantCulture));
+                }
+                csv.WriteLine(string.Join(",", header));
+
+                // --- 取得ループ ---
+                int framesWritten = 0;
+                int waitTimeoutMsec = 1000;
+                int numTimeouts = 3;
+                int timeoutCount = 0;
+                long frameAvailCount = 0;
+
+                while (framesWritten < numFrames && timeoutCount < numTimeouts)
+                {
+                    bool isDpxReady = false;
+                    rs = api.DPX_WaitForDataReady(waitTimeoutMsec, ref isDpxReady);
+                    if (rs != ReturnStatus.noError)
                     {
-                        float[] pTrace = pTraces[ntr];
-                        for (int n = 0; n < traceLen; n++)
-                        {
-                            traceFile.WriteLine("{0}\n", 10 * Math.Log10(pTrace[n] * 1e3));
-                        }
+                        Console.WriteLine("DPX_WaitForDataReady returned {0}", rs);
+                        timeoutCount++;
+                        continue;
                     }
 
-                    // Write bitmap data to a txt file.
-                    if(frameAvailCount == bmpidx)
+                    bool frameAvail = false;
+                    if (isDpxReady)
                     {
-                        // Create the txt file.
-                        var bitmapFile = new System.IO.StreamWriter("DPXbitmap.txt");
-                        // Acquire current trace information.
-                        int bitmapWidth = frameBuffer.spectrumBitmapWidth;
-                        int bitmapHeight = frameBuffer.spectrumBitmapHeight;
-                        int bitmapSize = frameBuffer.spectrumBitmapSize;
-                        float[] bitmap = frameBuffer.spectrumBitmap;
-
-                        // Generate the bitmap frame.
-                        for(int nh = 0; nh < bitmapHeight; nh++)
+                        rs = api.DPX_IsFrameBufferAvailable(ref frameAvail);
+                        if (rs != ReturnStatus.noError)
                         {
-                            for (int nw = 0; nw < bitmapWidth; nw++)
+                            Console.WriteLine("DPX_IsFrameBufferAvailable returned {0}", rs);
+                            timeoutCount++;
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        timeoutCount++;
+                        continue;
+                    }
+
+                    if (frameAvail)
+                    {
+                        frameAvailCount++;
+                        rs = api.DPX_GetFrameBuffer(ref frameBuffer);
+                        if (rs != ReturnStatus.noError)
+                        {
+                            Console.WriteLine("DPX_GetFrameBuffer returned {0}", rs);
+                            break;
+                        }
+
+                        api.DPX_GetFrameInfo(ref frameAvailCount, ref frameAvailCount); // 元サンプルと同様に info を取得（不要なら削除可）
+
+                        int deviceTraceLen = frameBuffer.spectrumTraceLength;
+                        int numTraces = frameBuffer.numSpectrumTraces;
+                        if (traceIndexToUse >= numTraces)
+                        {
+                            Console.WriteLine("Requested traceIndex {0} >= numTraces {1}. Using trace 0.", traceIndexToUse, numTraces);
+                            traceIndexToUse = 0;
+                        }
+
+                        float[] selectedTrace = frameBuffer.spectrumTraces[traceIndexToUse];
+                        // Resample to requested trace length if needed
+                        float[] traceForCsv;
+                        if (requestedTraceLength > 0 && requestedTraceLength != deviceTraceLen)
+                        {
+                            traceForCsv = ResampleLinear(selectedTrace, targetTraceLen);
+                        }
+                        else
+                        {
+                            // deviceTraceLen may differ from targetTraceLen when requestedTraceLength == 0 but getSettings.traceLength was nonzero
+                            if (deviceTraceLen != targetTraceLen)
                             {
-                                bitmapFile.Write("{0} ", bitmap[nh * bitmapWidth + nw]);
+                                // adjust freqs to deviceTraceLen to match actual data
+                                if (requestedTraceLength == 0)
+                                {
+                                    targetTraceLen = deviceTraceLen;
+                                    freqs = Linspace(centerFreq - bandwidth / 2.0, centerFreq + bandwidth / 2.0, targetTraceLen);
+                                }
                             }
-                            bitmapFile.WriteLine();
+                            traceForCsv = (deviceTraceLen == targetTraceLen) ? selectedTrace : ResampleLinear(selectedTrace, targetTraceLen);
                         }
 
-                        Console.WriteLine("Frame generated.\n");
+                        double[] dbms = ConvertToDbm(traceForCsv);
+
+                        // timestamp
+                        string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
+
+                        // CSV 行を書き込み (timestamp, val1, val2, ...)
+                        var line = new List<string> { ts };
+                        for (int i = 0; i < dbms.Length; i++)
+                        {
+                            // 出力の精度は必要に応じて調整してください
+                            line.Add(dbms[i].ToString("F6", CultureInfo.InvariantCulture));
+                        }
+                        csv.WriteLine(string.Join(",", line));
+                        csv.Flush();
+
+                        framesWritten++;
+
+                        // 必要ならビットマップ等も同様に保存可能（ここでは要求に沿いトレースのみCSV）
+                        api.DPX_FinishFrameBuffer();
                     }
+                } // while
 
-                    // Finish the frame buffer to get the next one.
-                    api.DPX_FinishFrameBuffer();
-                }
+                Console.WriteLine("Frames written: {0}", framesWritten);
+            } // using csv
 
-                // Check if the defined limit of traces to be generated is reached or if the wait time is exceeded.
-                if(numFrames > 0 && frameAvailCount == numFrames || timeoutCount == numTimeouts)
-                    isActive = false;
-            }
-
-            // Disconnect the device and finish up.
+            // --- 後片付け ---
             rs = api.DPX_SetEnable(false);
             rs = api.DEVICE_Stop();
             rs = api.DEVICE_Disconnect();
 
-            end:
-                Console.WriteLine("DPX acquisition routine complete.");
-                Console.WriteLine("Press enter key to exit...");
-                Console.ReadKey();
+            Console.WriteLine("Finished. CSV saved.");
         }
     }
 }
